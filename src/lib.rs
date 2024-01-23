@@ -26,6 +26,7 @@ static mut orig_freeaddrinfo: Option<FreeAddrInfoFn> = None;
 
 #[ctor]
 fn init() {
+    println!("Loading DNS lookup override");
     unsafe {
         let gai = CString::new("getaddrinfo").expect("CString::new failed");
         let ptr = dlsym(RTLD_NEXT, gai.as_ptr());
@@ -107,7 +108,6 @@ fn from_raw(chars: *const c_char) -> String {
 //
 
 fn inc_ref_count(ptr: *mut addrinfo) -> i32 {
-    println!("Increasing ref count for pointer {}", ptr as u64);
     let mut ref_counts = REF_COUNTS.lock().unwrap();
     let ref_key = AddrInfoWrapper(ptr);
 
@@ -118,7 +118,6 @@ fn inc_ref_count(ptr: *mut addrinfo) -> i32 {
             return *count;
         }
         None => {
-            println!("Creating ref count for pointer {}", ptr as usize);
             ref_counts.insert(ref_key, 1);
             return 1;
         }
@@ -126,7 +125,6 @@ fn inc_ref_count(ptr: *mut addrinfo) -> i32 {
 }
 
 fn dec_ref_count(ptr: *mut addrinfo) -> i32 {
-    println!("Decreasing ref count for pointer {}", ptr as u64);
     let mut ref_counts = REF_COUNTS.lock().unwrap();
     let ref_key = AddrInfoWrapper(ptr);
 
@@ -137,7 +135,6 @@ fn dec_ref_count(ptr: *mut addrinfo) -> i32 {
             return *count;
         }
         None => {
-            println!("Logic error: decreasing refcount on unknown pointer");
             return 0;
         }
     }
@@ -153,7 +150,6 @@ fn get_ref_count(ptr: *mut addrinfo) -> i32 {
             return *count;
         }
         None => {
-            println!("Logic error: decreasing refcount on unknown pointer");
             return -1;
         }
     }
@@ -179,9 +175,7 @@ pub extern "C" fn getaddrinfo(
     let cache = CACHE.lock().unwrap();
 
     if let Some(value) = cache.get(&key) {
-        println!("Found data from cache");
         if timestamp - value.timestamp > CACHE_LIFETIME_MS {
-            println!("Data is stale, so performing new lookup");
         } else {
             let count = inc_ref_count(value.ai);
             if count > 0 {
@@ -197,10 +191,9 @@ pub extern "C" fn getaddrinfo(
     drop(cache);
 
     // Cache miss, so do DNS lookup and cache result
-    println!("Performing DNS lookup");
     let retval = unsafe { orig_getaddrinfo.unwrap()(hostname, servname, hints, res) };
     if retval < 0 {
-        println!("Lookup error, so not caching result");
+        return retval;
     }
 
     timestamp = SystemTime::now()
@@ -227,7 +220,6 @@ pub extern "C" fn getaddrinfo(
 #[no_mangle]
 pub extern "C" fn freeaddrinfo(ai: *mut addrinfo) {
     // Always grab cache lock, so refcounts do not change while cache lock is held.
-    println!("freeaddrinfo() called");
     let _cache = CACHE.lock().unwrap();
     dec_ref_count(ai);
 
@@ -240,7 +232,6 @@ pub extern "C" fn freeaddrinfo(ai: *mut addrinfo) {
 
         // We might have handed out the pointer from the cache.
         if get_ref_count(removed.0) < 1 {
-            println!("Freeing pointer: {}", removed.0 as u64);
             unsafe { return orig_freeaddrinfo.unwrap()(removed.0) }
         }
     }
