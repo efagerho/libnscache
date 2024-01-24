@@ -1,3 +1,24 @@
+// Caches DNS queries made through getaddrinfo()
+//
+// Data structures
+// ===============
+// - CACHE: Hash table from getaddrinfo() params to responses.
+// - PARAMS: Hash table with pointers to cache keys.
+// - REF_COUNTS: Hash table with pointers to reference counts
+// - DEFER_QUEUE: Queue for deferred deletions.
+//
+// Typically an application performs getaddrinfo()/freeaddrinfo() calls as a pair.
+// If we instantly remove any data once it has no more references, then we never
+// get any cache hits. The solution is to instead add any free'd addrinfo pointers
+// to a defer list.
+//
+// The idea of the defer list is that a pointer with no references will get free'd
+// only after DEFER_CALL_COUNT calls to freeaddrinfo() has been made.
+//
+// All operations lock the cache prior to any changes, so the code has a global
+// lock to simplify implementation. DNS queries should be rare enough that this
+// should make no difference in practice.
+
 use ctor::ctor;
 use lazy_static::lazy_static;
 use libc::{addrinfo, c_int, c_void, dlsym, AF_UNSPEC, AI_ADDRCONFIG, AI_V4MAPPED, RTLD_NEXT};
@@ -9,13 +30,21 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // How many milliseconds to cache resolver data.
-const CACHE_LIFETIME_MS: u64 = 10000;
+const CACHE_LIFETIME_MS: u64 = 1000;
 
-// Maximum amount of unfree'd data.
-const MAX_GARBAGE_SIZE: usize = 1000;
+// Maximum amount of unfree'd and unused pointers.
+const DEFER_CALL_COUNT: usize = 1000;
 
 type GetAddrInfoFn = fn(*const c_char, *const c_char, *const addrinfo, *mut *mut addrinfo) -> i32;
 type FreeAddrInfoFn = fn(*mut addrinfo);
+
+fn from_raw(chars: *const c_char) -> String {
+    if chars.is_null() {
+        "".to_string()
+    } else {
+        unsafe { CStr::from_ptr(chars).to_str().unwrap().to_string() }
+    }
+}
 
 //
 // Init pointers to original functions
@@ -26,7 +55,7 @@ static mut orig_freeaddrinfo: Option<FreeAddrInfoFn> = None;
 
 #[ctor]
 fn init() {
-    println!("Loading DNS lookup override");
+    println!("Loading libc DNS resolver cacher");
     unsafe {
         let gai = CString::new("getaddrinfo").expect("CString::new failed");
         let ptr = dlsym(RTLD_NEXT, gai.as_ptr());
@@ -42,8 +71,8 @@ fn init() {
 // Cache for responses
 //
 
-#[derive(Eq, Hash, PartialEq)]
-struct CacheKey {
+#[derive(Eq, Hash, PartialEq, Clone)]
+struct GetAddrInfoParams {
     hostname: String,
     servname: String,
     flags: c_int,
@@ -52,7 +81,7 @@ struct CacheKey {
     protocol: c_int,
 }
 
-impl CacheKey {
+impl GetAddrInfoParams {
     fn new(hostname: *const c_char, servname: *const c_char, hints: *const addrinfo) -> Self {
         if hints.is_null() {
             Self {
@@ -76,13 +105,12 @@ impl CacheKey {
     }
 }
 
-struct CacheEntry {
+struct Response {
     timestamp: u64,
     ai: *mut addrinfo,
     retval: i32,
 }
-
-unsafe impl Send for CacheEntry {}
+unsafe impl Send for Response {}
 
 #[derive(Eq, Hash, PartialEq)]
 struct AddrInfoWrapper(*mut addrinfo);
@@ -90,67 +118,88 @@ struct AddrInfoWrapper(*mut addrinfo);
 unsafe impl Send for AddrInfoWrapper {}
 
 lazy_static! {
-    static ref REF_COUNTS: Mutex<HashMap<AddrInfoWrapper, i32>> = Mutex::new(HashMap::new());
-    static ref CACHE: Mutex<HashMap<CacheKey, CacheEntry>> = Mutex::new(HashMap::new());
-    static ref GARBAGE: Mutex<VecDeque<AddrInfoWrapper>> = Mutex::new(VecDeque::new());
-}
-
-fn from_raw(chars: *const c_char) -> String {
-    if chars.is_null() {
-        return "".to_string();
-    } else {
-        unsafe { CStr::from_ptr(chars).to_str().unwrap().to_string() }
-    }
+    static ref CACHE: Mutex<HashMap<GetAddrInfoParams, Response>> = Mutex::new(HashMap::new());
+    static ref PARAMS: Mutex<HashMap<AddrInfoWrapper, GetAddrInfoParams>> =
+        Mutex::new(HashMap::new());
 }
 
 //
-// Reference counting helpers
+// Deferred deletion logic
 //
 
-fn inc_ref_count(ptr: *mut addrinfo) -> i32 {
+#[derive(Clone)]
+struct RefCount {
+    refs: i32,
+    deleted: bool,
+}
+
+lazy_static! {
+    static ref REF_COUNTS: Mutex<HashMap<AddrInfoWrapper, RefCount>> = Mutex::new(HashMap::new());
+    static ref DEFER_QUEUE: Mutex<VecDeque<AddrInfoWrapper>> = Mutex::new(VecDeque::new());
+}
+
+fn inc_ref_count(ptr: *mut addrinfo) -> RefCount {
     let mut ref_counts = REF_COUNTS.lock().unwrap();
     let ref_key = AddrInfoWrapper(ptr);
 
     let count = ref_counts.get_mut(&ref_key);
     match count {
         Some(count) => {
-            *count = *count + 1;
-            return *count;
+            count.refs += 1;
+            RefCount {
+                refs: count.refs,
+                deleted: count.deleted,
+            }
         }
         None => {
-            ref_counts.insert(ref_key, 1);
-            return 1;
+            ref_counts.insert(
+                ref_key,
+                RefCount {
+                    refs: 1,
+                    deleted: false,
+                },
+            );
+            RefCount {
+                refs: 1,
+                deleted: false,
+            }
         }
     }
 }
 
-fn dec_ref_count(ptr: *mut addrinfo) -> i32 {
+fn defer_delete_ptr(ptr: *mut addrinfo) {
     let mut ref_counts = REF_COUNTS.lock().unwrap();
     let ref_key = AddrInfoWrapper(ptr);
 
     let count = ref_counts.get_mut(&ref_key);
     match count {
         Some(count) => {
-            *count = *count - 1;
-            return *count;
+            count.refs -= 1;
+            if !count.deleted {
+                let mut queue = DEFER_QUEUE.lock().unwrap();
+                queue.push_back(AddrInfoWrapper(ptr));
+                count.deleted = true;
+            }
         }
         None => {
-            return 0;
+            println!("Logic error: deleting an unknown pointer");
         }
     }
 }
 
-fn get_ref_count(ptr: *mut addrinfo) -> i32 {
+fn get_ref_count(ptr: *mut addrinfo) -> RefCount {
     let mut ref_counts = REF_COUNTS.lock().unwrap();
     let ref_key = AddrInfoWrapper(ptr);
 
     let count = ref_counts.get_mut(&ref_key);
     match count {
-        Some(count) => {
-            return *count;
-        }
+        Some(count) => count.clone(),
         None => {
-            return -1;
+            println!("Logic error: asking refcount on unknown pointer");
+            RefCount {
+                refs: -1,
+                deleted: false,
+            }
         }
     }
 }
@@ -170,28 +219,30 @@ pub extern "C" fn getaddrinfo(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let key = CacheKey::new(hostname, servname, hints);
 
-    let cache = CACHE.lock().unwrap();
+    let params = GetAddrInfoParams::new(hostname, servname, hints);
+    let mut cache = CACHE.lock().unwrap();
 
-    if let Some(value) = cache.get(&key) {
-        if timestamp - value.timestamp > CACHE_LIFETIME_MS {
-        } else {
-            let count = inc_ref_count(value.ai);
-            if count > 0 {
-                unsafe {
-                    *res = value.ai;
-                }
-                return value.retval;
+    let cached = cache.get(&params);
+    if let Some(value) = cached {
+        if timestamp - value.timestamp < CACHE_LIFETIME_MS {
+            inc_ref_count(value.ai);
+            unsafe {
+                *res = value.ai;
             }
+            return value.retval;
         }
+
+        PARAMS.lock().unwrap().remove(&AddrInfoWrapper(value.ai));
+        cache.remove(&params);
     }
 
     // Release locks before doing expensive DNS lookup
     drop(cache);
 
-    // Cache miss, so do DNS lookup and cache result
     let retval = unsafe { orig_getaddrinfo.unwrap()(hostname, servname, hints, res) };
+
+    // Do not cache responses that are failures.
     if retval < 0 {
         return retval;
     }
@@ -201,18 +252,23 @@ pub extern "C" fn getaddrinfo(
         .unwrap()
         .as_millis() as u64;
 
-    let data = unsafe {
-        CacheEntry {
-            timestamp: timestamp,
-            ai: *res,
-            retval: retval,
-        }
+    let response = Response {
+        timestamp,
+        ai: unsafe { *res },
+        retval,
     };
+    let ai = response.ai;
 
     let mut cache = CACHE.lock().unwrap();
 
-    inc_ref_count(data.ai);
-    cache.insert(key, data);
+    // If someone else filled cache before us, remove the value.
+    if let Some(value) = cache.get(&params) {
+        PARAMS.lock().unwrap().remove(&AddrInfoWrapper(value.ai));
+    }
+
+    inc_ref_count(response.ai);
+    cache.insert(params.clone(), response);
+    PARAMS.lock().unwrap().insert(AddrInfoWrapper(ai), params);
 
     retval
 }
@@ -220,19 +276,27 @@ pub extern "C" fn getaddrinfo(
 #[no_mangle]
 pub extern "C" fn freeaddrinfo(ai: *mut addrinfo) {
     // Always grab cache lock, so refcounts do not change while cache lock is held.
-    let _cache = CACHE.lock().unwrap();
-    dec_ref_count(ai);
+    let mut cache = CACHE.lock().unwrap();
 
-    let mut garbage = GARBAGE.lock().unwrap();
+    defer_delete_ptr(ai);
 
-    garbage.push_back(AddrInfoWrapper(ai));
+    let mut queue = DEFER_QUEUE.lock().unwrap();
 
-    if garbage.len() > MAX_GARBAGE_SIZE {
-        let removed = garbage.pop_front().unwrap();
+    if queue.len() > DEFER_CALL_COUNT {
+        let deferred = queue.pop_front().unwrap();
 
-        // We might have handed out the pointer from the cache.
-        if get_ref_count(removed.0) < 1 {
-            unsafe { return orig_freeaddrinfo.unwrap()(removed.0) }
+        let refs = get_ref_count(deferred.0);
+        if refs.refs > 0 {
+            return;
         }
+
+        // Cleanup any cached data about the pointer.
+        REF_COUNTS.lock().unwrap().remove(&deferred);
+        let mut params = PARAMS.lock().unwrap();
+        if let Some(p) = params.remove(&deferred) {
+            cache.remove(&p);
+        }
+
+        unsafe { orig_freeaddrinfo.unwrap()(deferred.0) }
     }
 }
